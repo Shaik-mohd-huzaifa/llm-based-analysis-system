@@ -18,6 +18,17 @@ from nltk.tokenize import word_tokenize
 from nltk.stem import WordNetLemmatizer
 import re
 from datetime import datetime
+from pathlib import Path
+from tabulate import tabulate
+
+# Pydantic models
+class ChatRequest(BaseModel):
+    query: str
+    role: str
+
+class ChatResponse(BaseModel):
+    response: str
+    metadata: Dict
 
 # Load environment variables
 load_dotenv()
@@ -69,14 +80,6 @@ class SubthemeReviewsRequest(BaseModel):
     max_rating: Optional[float] = None
     sort_by: Optional[str] = "relevance"  # Options: relevance, rating, date
     limit: Optional[int] = 50
-
-class ChatRequest(BaseModel):
-    query: str
-    role: str = "analyst"
-
-class ChatResponse(BaseModel):
-    response: str
-    metadata: Optional[Dict] = None
 
 # Download required NLTK data
 nltk.download('punkt')
@@ -923,6 +926,28 @@ def get_recommended_actions(analysis_results: Dict) -> List[str]:
 async def chat_endpoint(request: ChatRequest):
     """Process a chat request and return a formatted response."""
     try:
+        print(f"Received chat request - Query: {request.query}, Role: {request.role}")
+        
+        # Look for CSV in the same directory as main.py
+        current_dir = Path(__file__).parent
+        csv_path = current_dir / "Jewelry Store Google Map Reviews.csv"
+        
+        print(f"Looking for CSV file at: {csv_path}")
+        
+        # Load data if not already loaded
+        if not hasattr(app.state, 'df'):
+            try:
+                print("Loading CSV data...")
+                app.state.df = pd.read_csv(csv_path)
+                app.state.df['date_Date Created'] = pd.to_datetime(app.state.df['date_Date Created'])
+                print(f"Data loaded successfully. Shape: {app.state.df.shape}")
+            except Exception as e:
+                print(f"Error loading CSV: {str(e)}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Error loading data: {str(e)}"
+                )
+
         query_lower = request.query.lower()
         
         # Handle different types of queries
@@ -932,36 +957,122 @@ async def chat_endpoint(request: ChatRequest):
             month = current_date.month
             year = current_date.year
             
-            results = analyze_monthly_issues(month, year)
-            results['recommended_actions'] = get_recommended_actions(results)
+            # Filter reviews for the specified month
+            month_mask = (app.state.df['date_Date Created'].dt.month == month) & \
+                        (app.state.df['date_Date Created'].dt.year == year)
+            month_reviews = app.state.df[month_mask]
+            
+            # Get negative reviews (rating <= 3)
+            negative_reviews = month_reviews[month_reviews['score_Overall Rating'] <= 3]
+            
+            results = {
+                'key_findings': [],
+                'statistics': {
+                    'total_reviews': len(month_reviews),
+                    'negative_reviews': len(negative_reviews),
+                    'average_rating': month_reviews['score_Overall Rating'].mean()
+                },
+                'trends': [],
+                'recommended_actions': []
+            }
+            
+            # Add findings based on the analysis
+            if not negative_reviews.empty:
+                # Group by cities instead of themes
+                city_ratings = month_reviews.groupby('string_City')['score_Overall Rating'].agg(['mean', 'count'])
+                low_rated_cities = city_ratings[city_ratings['mean'] < 4.0]
+                
+                for city, stats in low_rated_cities.iterrows():
+                    results['key_findings'].append(
+                        f"{city}: {stats['count']} reviews, average rating {stats['mean']:.1f}"
+                    )
+                    
+                # Add recommended actions
+                if len(results['key_findings']) > 0:
+                    results['recommended_actions'].append(
+                        "Focus on improving customer experience in cities with lower ratings"
+                    )
             
         elif "difference" in query_lower or "compare" in query_lower:
-            # Extract store locations from query
-            store1 = "Boston"  # Example - you should extract this from the query
-            store2 = "New York"  # Example - you should extract this from the query
+            # Extract cities from the query if possible, otherwise use top cities
+            cities = app.state.df['string_City'].value_counts().head(2).index.tolist()
+            city1, city2 = cities[0], cities[1]
             
-            results = compare_store_feedback(store1, store2)
-            results['recommended_actions'] = get_recommended_actions(results)
+            # Compare cities
+            city1_reviews = app.state.df[app.state.df['string_City'] == city1]
+            city2_reviews = app.state.df[app.state.df['string_City'] == city2]
             
-        elif "action" in query_lower:
-            # Generate action items based on recent reviews
-            recent_reviews = df.sort_values('date_Date Created').tail(100)
+            results = {
+                'statistics': {
+                    city1: {
+                        'total_reviews': len(city1_reviews),
+                        'average_rating': city1_reviews['score_Overall Rating'].mean(),
+                        'positive_ratio': len(city1_reviews[city1_reviews['score_Overall Rating'] >= 4]) / len(city1_reviews)
+                    },
+                    city2: {
+                        'total_reviews': len(city2_reviews),
+                        'average_rating': city2_reviews['score_Overall Rating'].mean(),
+                        'positive_ratio': len(city2_reviews[city2_reviews['score_Overall Rating'] >= 4]) / len(city2_reviews)
+                    }
+                },
+                'key_findings': [],
+                'recommended_actions': []
+            }
+            
+            # Add comparison findings
+            for city, reviews in [(city1, city1_reviews), (city2, city2_reviews)]:
+                avg_rating = reviews['score_Overall Rating'].mean()
+                results['key_findings'].append(
+                    f"{city}: {len(reviews)} reviews, average rating {avg_rating:.1f}"
+                )
+            
+        elif "action" in query_lower or "recommend" in query_lower:
+            # Get recent reviews (last 30 days)
+            recent_date = app.state.df['date_Date Created'].max() - pd.Timedelta(days=30)
+            recent_reviews = app.state.df[app.state.df['date_Date Created'] >= recent_date]
+            
             results = {
                 'key_findings': [],
                 'recommended_actions': []
             }
             
-            # Analyze recent reviews
-            for theme, count in recent_reviews['Concepts'].value_counts().head(5).items():
-                results['key_findings'].append(f"{theme}: {count} mentions")
+            # Analyze recent reviews by city
+            city_ratings = recent_reviews.groupby('string_City')['score_Overall Rating'].agg(['mean', 'count'])
+            for city, stats in city_ratings.iterrows():
+                results['key_findings'].append(
+                    f"{city}: {stats['count']} recent reviews, average rating {stats['mean']:.1f}"
+                )
             
-            results['recommended_actions'] = get_recommended_actions(results)
+            # Add general recommendations
+            low_rated_cities = city_ratings[city_ratings['mean'] < 4.0]
+            if not low_rated_cities.empty:
+                results['recommended_actions'].extend([
+                    f"Improve customer service in {city}" for city in low_rated_cities.index
+                ])
             
         else:
-            # Generic analysis
+            # Get overall statistics by city
+            city_stats = app.state.df.groupby('string_City').agg({
+                'score_Overall Rating': ['count', 'mean'],
+                'score_Count People Found Review Helpful': 'sum'
+            }).round(2)
+            
             results = {
-                'key_findings': ["Query not specific enough. Please ask about monthly issues, store comparisons, or specific actions."],
-                'recommended_actions': ["Refine your query to get more specific insights."]
+                'key_findings': [
+                    f"Total reviews analyzed: {len(app.state.df)}",
+                    f"Average rating across all cities: {app.state.df['score_Overall Rating'].mean():.1f}"
+                ],
+                'statistics': {
+                    'total_reviews': len(app.state.df),
+                    'cities_analyzed': len(city_stats),
+                    'average_rating': app.state.df['score_Overall Rating'].mean()
+                },
+                'recommended_actions': [
+                    "Specify your query to get more detailed insights:",
+                    "- Ask about monthly issues",
+                    "- Compare specific cities",
+                    "- Request recent trends and actions"
+                ]
             }
         
         # Format response based on role
@@ -978,6 +1089,7 @@ async def chat_endpoint(request: ChatRequest):
         )
         
     except Exception as e:
+        print(f"Error in chat endpoint: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"Error processing query: {str(e)}"
