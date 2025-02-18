@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.swp
+venv/
+.env
+.env.local
+*.sqlite3
+instance/
+*.log
+
+# FastAPI (Uvicorn, etc.)
+*.db
+*.pid
+*.pyc
+*.pyo
+*.pyd
+
+# Node.js / React
+node_modules/
+*.log
+npm-debug.log*
+yarn-error.log*
+*.cache
+dist/
+build/
+coverage/
+*.env
+
+# Editor / OS Files
+.DS_Store
+.vscode/
+.idea/
+*.sublime-workspace
+*.swp
+Thumbs.db
